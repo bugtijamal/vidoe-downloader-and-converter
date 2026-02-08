@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Downloader & Converter | MP3 & MP4</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Animated Background -->
+    <div class="bg-animation">
+        <div class="bg-gradient"></div>
+        <div class="floating-shapes">
+            <div class="shape shape-1"></div>
+            <div class="shape shape-2"></div>
+            <div class="shape shape-3"></div>
+            <div class="shape shape-4"></div>
+        </div>
+    </div>
+
+    <!-- Navigation -->
+    <nav class="navbar">
+        <div class="nav-container">
+            <a href="/" class="logo">
+                <i class="fas fa-download"></i>
+                <span>Media<strong>Grab</strong></span>
+            </a>
+            <div class="nav-links">
+                <a href="#features">Features</a>
+                <a href="#how-it-works">How It Works</a>
+                <a href="#faq">FAQ</a>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Hero Section -->
+    <main class="main-container">
+        <section class="hero">
+            <div class="hero-content">
+                <div class="badge">
+                    <i class="fas fa-bolt"></i>
+                    Fast & Free
+                </div>
+                <h1>Download Videos as <span class="gradient-text">MP3</span> or <span class="gradient-text-alt">MP4</span></h1>
+                <p class="subtitle">Convert and download your favorite videos from YouTube, Facebook, Instagram, TikTok and more in high quality</p>
+            </div>
+        </section>
+
+        <!-- Converter Card -->
+        <section class="converter-section">
+            <div class="converter-card">
+                <div class="card-header">
+                    <div class="supported-platforms" id="platforms">
+                        <!-- Platforms loaded dynamically -->
+                    </div>
+                </div>
+
+                <!-- Format Selection Toggle -->
+                <div class="format-selection">
+                    <div class="format-toggle">
+                        <button class="format-btn active" data-format="audio" id="audioFormatBtn">
+                            <i class="fas fa-music"></i>
+                            <span>Audio</span>
+                        </button>
+                        <button class="format-btn" data-format="video" id="videoFormatBtn">
+                            <i class="fas fa-video"></i>
+                            <span>Video</span>
+                        </button>
+                        <div class="format-slider"></div>
+                    </div>
+                </div>
+
+                <!-- Audio Format Selection -->
+                <div class="audio-format-selection" id="audioFormatSelection">
+                    <label class="format-label">
+                        <i class="fas fa-music"></i>
+                        <span>Choose Audio Format</span>
+                    </label>
+                    <div class="audio-format-grid" id="audioFormatGrid">
+                        <!-- Formats will be loaded dynamically -->
+                    </div>
+                    <div class="format-info">
+                        <small id="audioFormatInfo">Select your preferred audio format</small>
+                    </div>
+                </div>
+
+                <!-- Quality Selection (for video) -->
+                <div class="quality-selection" id="qualitySelection">
+                    <label for="qualitySelect">Video Quality:</label>
+                    <div class="quality-dropdown">
+                        <select id="qualitySelect">
+                            <option value="best">Best Quality</option>
+                            <option value="1080p">1080p (Full HD)</option>
+                            <option value="720p" selected>720p (HD)</option>
+                            <option value="480p">480p (SD)</option>
+                            <option value="360p">360p (Low)</option>
+                            <option value="144p">144p (Very Low)</option>
+                        </select>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                </div>
+
+                <!-- Audio Quality Info -->
+                <div class="audio-quality-info" id="audioQualityInfo">
+                    <i class="fas fa-headphones"></i>
+                    <span>High Quality Audio with Album Art</span>
+                </div>
+
+                <div class="input-section">
+                    <div class="input-wrapper">
+                        <i class="fas fa-link input-icon"></i>
+                        <input 
+                            type="url" 
+                            id="videoUrl" 
+                            placeholder="Paste your video URL here..."
+                            autocomplete="off"
+                        >
+                        <button class="clear-btn" id="clearBtn" title="Clear">
+                            <i class="fas fa-times"></i>
+                        </button>
+                    </div>
+                    <button class="convert-btn" id="convertBtn">
+                        <span class="btn-text">
+                            <i class="fas fa-download"></i>
+                            <span id="convertBtnText">Convert to MP3</span>
+                        </span>
+                        <span class="btn-loading">
+                            <i class="fas fa-spinner fa-spin"></i>
+                            Processing...
+                        </span>
+                    </button>
+                </div>
+
+                <!-- Video Info Preview -->
+                <div class="video-preview" id="videoPreview">
+                    <div class="preview-thumbnail">
+                        <img id="thumbnail" src="" alt="Video Thumbnail">
+                        <div class="duration-badge" id="durationBadge">00:00</div>
+                        <div class="play-overlay">
+                            <i class="fas fa-play"></i>
+                        </div>
+                    </div>
+                    <div class="preview-info">
+                        <h3 id="videoTitle">Video Title</h3>
+                        <div class="meta-info">
+                            <span><i class="fas fa-user"></i> <span id="uploader">Uploader</span></span>
+                            <span><i class="fas fa-globe"></i> <span id="platform">Platform</span></span>
+                        </div>
+                        <div class="video-stats" id="videoStats">
+                            <span><i class="fas fa-eye"></i> <span id="viewCount">0</span> views</span>
+                            <span><i class="fas fa-heart"></i> <span id="likeCount">0</span> likes</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="preview-loading" id="previewLoading">
+                    <div class="spinner"></div>
+                    <p>Loading video info...</p>
+                </div>
+
+                <!-- Progress Section -->
+                <div class="progress-section" id="progressSection">
+                    <div class="progress-header">
+                        <span class="progress-status" id="progressStatus">
+                            <span class="status-icon">🚀</span>
+                            <span class="status-text">Preparing...</span>
+                        </span>
+                        <span class="progress-percent" id="progressPercent">0%</span>
+                    </div>
+                    
+                    <!-- Multi-Stage Progress -->
+                    <div class="progress-stages">
+                        <div class="stage" data-stage="starting">
+                            <div class="stage-icon">🚀</div>
+                            <span class="stage-label">Starting</span>
+                        </div>
+                        <div class="stage" data-stage="downloading">
+                            <div class="stage-icon">📥</div>
+                            <span class="stage-label">Download</span>
+                        </div>
+                        <div class="stage" data-stage="processing">
+                            <div class="stage-icon">⚙️</div>
+                            <span class="stage-label">Processing</span>
+                        </div>
+                        <div class="stage" data-stage="embedding">
+                            <div class="stage-icon">🎵</div>
+                            <span class="stage-label">Embedding</span>
+                        </div>
+                        <div class="stage" data-stage="complete">
+                            <div class="stage-icon">✓</div>
+                            <span class="stage-label">Complete</span>
+                        </div>
+                    </div>
+                    
+                    <div class="progress-bar-container">
+                        <div class="progress-bar">
+                            <div class="progress-fill" id="progressFill"></div>
+                            <div class="progress-glow"></div>
+                        </div>
+                    </div>
+                    
+                    <p class="progress-info" id="progressInfo">Initializing download...</p>
+                    
+                    <div class="progress-details">
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">📊</span>
+                            <span class="detail-value" id="progressPercentDetail">0%</span>
+                            <span class="detail-label">Progress</span>
+                        </div>
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">⚡</span>
+                            <span class="detail-value" id="downloadSpeed">--</span>
+                            <span class="detail-label">Speed</span>
+                        </div>
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">⏱️</span>
+                            <span class="detail-value" id="eta">--</span>
+                            <span class="detail-label">ETA</span>
+                        </div>
+                    </div>
+                    
+                    <div class="progress-details" id="extraDetails" style="margin-top: 0.75rem;">
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">📦</span>
+                            <span class="detail-value" id="downloadedSize">0 MB</span>
+                            <span class="detail-label">Downloaded</span>
+                        </div>
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">📏</span>
+                            <span class="detail-value" id="totalSize">--</span>
+                            <span class="detail-label">Total Size</span>
+                        </div>
+                        <div class="progress-detail-item">
+                            <span class="detail-icon">🔄</span>
+                            <span class="detail-value" id="progressStage">Starting</span>
+                            <span class="detail-label">Stage</span>
+                        </div>
+                    </div>
+                    
+                    <button class="cancel-btn" id="cancelBtn">
+                        <i class="fas fa-times"></i>
+                        <span>Cancel Download</span>
+                    </button>
+                    
+                    <p class="stage-progress" id="stageProgress"></p>
+                </div>
+
+                <!-- Download Section -->
+                <div class="download-section" id="downloadSection">
+                    <div class="success-animation">
+                        <div class="checkmark">
+                            <i class="fas fa-check"></i>
+                        </div>
+                    </div>
+                    <h3>Conversion Complete!</h3>
+                    
+                    <!-- Format Badge -->
+                    <div class="format-badge" id="formatBadge">
+                        <i class="fas fa-music"></i>
+                        <span>MP3 Audio</span>
+                    </div>
+                    
+                    <p class="file-name" id="downloadFileName">audio.mp3</p>
+                    
+                    <div class="file-features" id="fileFeatures">
+                        <span class="feature-tag">
+                            <i class="fas fa-music"></i> <span id="qualityTag">320kbps</span>
+                        </span>
+                        <span class="feature-tag" id="thumbnailTag">
+                            <i class="fas fa-image"></i> Cover Art
+                        </span>
+                        <span class="feature-tag" id="metadataTag">
+                            <i class="fas fa-tag"></i> Metadata
+                        </span>
+                    </div>
+                    
+                    <div class="file-size" id="fileSize">
+                        <i class="fas fa-file"></i> <span id="fileSizeValue">--</span>
+                    </div>
+                    
+                    <button class="download-btn" id="downloadBtn">
+                        <i class="fas fa-download"></i>
+                        <span id="downloadBtnText">Download MP3</span>
+                    </button>
+                    <button class="new-convert-btn" id="newConvertBtn">
+                        <i class="fas fa-plus"></i>
+                        Convert Another
+                    </button>
+                </div>
+
+                <!-- Error Section -->
+                <div class="error-section" id="errorSection">
+                    <div class="error-icon">
+                        <i class="fas fa-exclamation-triangle"></i>
+                    </div>
+                    <h3>Oops! Something went wrong</h3>
+                    <p id="errorMessage">Error message here</p>
+                    <button class="retry-btn" id="retryBtn">
+                        <i class="fas fa-redo"></i>
+                        Try Again
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Features Section -->
+        <section class="features-section" id="features">
+            <h2 class="section-title">Why Choose Us?</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon audio-icon">
+                        <i class="fas fa-music"></i>
+                    </div>
+                    <h3>Multiple Audio Formats</h3>
+                    <p>MP3, AAC/M4A, OPUS, OGG - Choose the best format for your device</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon video-icon">
+                        <i class="fas fa-film"></i>
+                    </div>
+                    <h3>HD Video Download</h3>
+                    <p>Download videos in 1080p, 720p, 480p or best available quality</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-bolt"></i>
+                    </div>
+                    <h3>Lightning Fast</h3>
+                    <p>Optimized servers for quick downloads and conversions</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-shield-alt"></i>
+                    </div>
+                    <h3>Secure & Private</h3>
+                    <p>Your files are automatically deleted after download</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-image"></i>
+                    </div>
+                    <h3>Album Art Included</h3>
+                    <p>Automatically embeds video thumbnail as cover art</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">
+                        <i class="fas fa-globe"></i>
+                    </div>
+                    <h3>Multi-Platform</h3>
+                    <p>Support for YouTube, Facebook, Instagram, TikTok & more</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- How It Works -->
+        <section class="how-it-works" id="how-it-works">
+            <h2 class="section-title">How It Works</h2>
+            <div class="steps-container">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <div class="step-content">
+                        <h3>Choose Format</h3>
+                        <p>Select audio format (MP3, AAC, OPUS, OGG) or video quality</p>
+                    </div>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <div class="step-content">
+                        <h3>Paste URL</h3>
+                        <p>Copy and paste the video URL from any supported platform</p>
+                    </div>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <div class="step-content">
+                        <h3>Download</h3>
+                        <p>Click convert and download your file instantly</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- FAQ Section -->
+        <section class="faq-section" id="faq">
+            <h2 class="section-title">Frequently Asked Questions</h2>
+            <div class="faq-container">
+                <div class="faq-item">
+                    <div class="faq-question">
+                        <span>Which audio formats are available?</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                    <div class="faq-answer">
+                        <p>We support MP3 (320kbps - universal), AAC/M4A (256kbps - best for Apple devices), OPUS (192kbps - modern codec), and OGG Vorbis (192kbps - open source).</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <div class="faq-question">
+                        <span>Which platforms are supported?</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                    <div class="faq-answer">
+                        <p>We support YouTube, YouTube Shorts, Facebook Videos, Facebook Reels, Instagram Posts & Reels, TikTok, and Twitter/X videos.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <div class="faq-question">
+                        <span>What's the difference between audio formats?</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                    <div class="faq-answer">
+                        <p>MP3 works everywhere, AAC/M4A is optimized for Apple devices with better quality at smaller size, OPUS offers the best quality-to-size ratio for modern players, and OGG is great for Android.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <div class="faq-question">
+                        <span>Is this service free?</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                    <div class="faq-answer">
+                        <p>Yes! Our service is completely free with no hidden charges, subscriptions, or limitations.</p>
+                    </div>
+                </div>
+                <div class="faq-item">
+                    <div class="faq-question">
+                        <span>Does the audio include album art?</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </div>
+                    <div class="faq-answer">
+                        <p>Yes! We automatically embed the video thumbnail as album artwork for all audio formats, along with title, artist, and other metadata.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Footer -->
+    <footer class="footer">
+        <div class="footer-content">
+            <div class="footer-logo">
+                <i class="fas fa-download"></i>
+                <span>MediaGrab</span>
+            </div>
+            <p>&copy; 2024 MediaGrab. All rights reserved.</p>
+            <p class="disclaimer">This service is for personal use only. Please respect copyright laws.</p>
+        </div>
+    </footer>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast">
+        <i class="fas fa-info-circle" id="toastIcon"></i>
+        <span id="toastMessage">Notification message</span>
+    </div>
+     <!-- Video Preview Modal -->
+       <div class="video-modal" id="videoModal">
+        <div class="video-modal-backdrop" id="videoModalBackdrop"></div>
+        <div class="video-modal-content">
+            <button class="video-modal-close" id="videoModalClose">
+                <i class="fas fa-times"></i>
+            </button>
+            <div class="video-modal-player" id="videoModalPlayer">
+                <!-- iframe will be injected here -->
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

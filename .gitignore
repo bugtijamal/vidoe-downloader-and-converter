@@ -1,0 +1,10 @@
+/downloads
+/output
+*.log
+*.tmp
+*.bak
+*.cache
+*.aux
+*.out
+*.toc
+*.md
