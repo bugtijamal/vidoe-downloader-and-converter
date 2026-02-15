@@ -1,7 +1,33 @@
-flask==3.0.0
-flask-cors==4.0.0
-flask-limiter==3.5.0
-yt-dlp==2024.1.21
+# Flask and Web Framework
+Flask==3.0.0
+Flask-CORS==4.0.0
+Flask-Limiter==3.5.0
+Werkzeug==3.0.1
+
+# Video/Audio Download
+yt-dlp==2023.12.30
+
+# Image Processing
+Pillow==10.1.0
+
+# Audio Metadata
 mutagen==1.47.0
-Pillow==10.2.0
+
+# HTTP Requests
 requests==2.31.0
+
+# Process Management (IMPORTANT - NEW)
+psutil==5.9.6
+
+# Utilities
+python-dateutil==2.8.2
+
+# Rate Limiting Storage
+limits==3.7.0
+
+# Optional but recommended for better performance
+brotli==1.1.0
+certifi==2023.11.17
+charset-normalizer==3.3.2
+idna==3.6
+urllib3==2.1.0

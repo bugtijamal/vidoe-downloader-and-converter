@@ -26,6 +26,13 @@ import hashlib
 import shutil
 import base64
 
+# Try to import psutil for better process management
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+
 # ================== Logging ==================
 logging.basicConfig(
     level=logging.INFO,
@@ -55,9 +62,13 @@ limiter = Limiter(
 # ================== Config ==================
 DOWNLOAD_FOLDER = 'downloads'
 TEMP_FOLDER = 'temp'
-MAX_DURATION = 3600       # max 1 hour
-CLEANUP_AGE = 300         # 5 minutes
+MAX_DURATION = 14400          # 4 hours max
+CLEANUP_AGE = 600             # 10 minutes
 MAX_CONCURRENT_DOWNLOADS = 5
+DOWNLOAD_TIMEOUT = 3600       # 1 hour max download time
+STALL_TIMEOUT = 180           # 3 minutes without progress = stalled
+PROCESSING_STALL_TIMEOUT = 600  # 10 minutes for processing stage
+FFMPEG_TIMEOUT = 1800         # 30 minutes for ffmpeg conversion
 
 for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
     os.makedirs(folder, exist_ok=True)
@@ -65,6 +76,10 @@ for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
 conversion_progress = {}
 progress_lock = threading.Lock()
 active_downloads = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
+# Track active processes
+active_processes = {}
+process_lock = threading.Lock()
 
 video_info_cache = {}
 cache_lock = threading.Lock()
@@ -83,7 +98,6 @@ VIDEO_ENCODE_SETTINGS = {
     '480p':  {'scale': '-2:480',  'crf': '24', 'maxrate': '1500k', 'bufsize': '3000k'},
     '360p':  {'scale': '-2:360',  'crf': '26', 'maxrate': '800k',  'bufsize': '1600k'},
     '144p':  {'scale': '-2:144',  'crf': '28', 'maxrate': '400k',  'bufsize': '800k'},
-    # 'best' = keep original resolution, but still H.264 + AAC
     'best':  {'scale': None,      'crf': '20', 'maxrate': None,    'bufsize': None},
 }
 
@@ -138,6 +152,220 @@ AUDIO_FORMATS = {
     }
 }
 
+
+# ================== Helper: Calculate Dynamic Timeout ==================
+def calculate_timeout(duration, file_size_estimate=None):
+    """Calculate timeout based on video duration and estimated file size"""
+    if not duration:
+        return DOWNLOAD_TIMEOUT
+    
+    # Base: 10 minutes + 2 minutes per 10 minutes of video
+    base_timeout = 600
+    duration_factor = (duration // 600) * 120
+    
+    # For very long videos (> 1 hour), add extra time
+    if duration > 3600:
+        extra_time = ((duration - 3600) // 600) * 60
+    else:
+        extra_time = 0
+    
+    total_timeout = base_timeout + duration_factor + extra_time
+    
+    # Cap at 2 hours
+    return min(total_timeout, 7200)
+
+
+def calculate_ffmpeg_timeout(duration):
+    """Calculate ffmpeg timeout based on video duration"""
+    if not duration:
+        return FFMPEG_TIMEOUT
+    
+    # Base: 5 minutes + 30 seconds per minute of video
+    base_timeout = 300
+    duration_factor = (duration // 60) * 30
+    
+    total_timeout = base_timeout + duration_factor
+    
+    # Cap at 2 hours
+    return min(total_timeout, 7200)
+
+
+def kill_process_tree(pid):
+    """Kill a process and all its children"""
+    if not HAS_PSUTIL:
+        try:
+            os.kill(pid, 9)
+        except:
+            pass
+        return True
+    
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        
+        # Kill children first
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        
+        # Kill parent
+        try:
+            parent.kill()
+        except psutil.NoSuchProcess:
+            pass
+            
+        return True
+    except Exception as e:
+        logger.error(f"[KILL] Error killing process {pid}: {e}")
+        return False
+
+
+def run_ffmpeg_with_progress(cmd, task_id, timeout=1800, stage="processing"):
+    """Run ffmpeg command with progress updates to prevent stall detection"""
+    try:
+        # Start the process
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=1
+        )
+        
+        # Store process for potential killing
+        with process_lock:
+            active_processes[task_id] = process
+        
+        start_time = time.time()
+        last_update = time.time()
+        
+        # Monitor the process
+        while True:
+            # Check if process is still running
+            poll = process.poll()
+            if poll is not None:
+                # Process finished
+                stdout, stderr = process.communicate()
+                
+                with process_lock:
+                    if task_id in active_processes:
+                        del active_processes[task_id]
+                
+                if poll == 0:
+                    return True, ""
+                else:
+                    return False, stderr
+            
+            # Check timeout
+            if time.time() - start_time > timeout:
+                logger.error(f"[FFMPEG] Timeout for task {task_id[:8]}")
+                try:
+                    process.kill()
+                except:
+                    pass
+                with process_lock:
+                    if task_id in active_processes:
+                        del active_processes[task_id]
+                return False, "FFmpeg timeout"
+            
+            # Update progress periodically to prevent stall detection
+            if time.time() - last_update > 10:  # Update every 10 seconds
+                with progress_lock:
+                    if task_id in conversion_progress:
+                        conversion_progress[task_id]['last_update'] = time.time()
+                        current = conversion_progress[task_id]
+                        if current.get('status') == stage:
+                            elapsed = int(time.time() - start_time)
+                            base_msg = current.get('message', 'Processing').split('(')[0].strip()
+                            current['message'] = f"{base_msg} ({elapsed}s elapsed)..."
+                last_update = time.time()
+            
+            time.sleep(0.5)
+            
+    except Exception as e:
+        logger.error(f"[FFMPEG] Exception: {e}")
+        with process_lock:
+            if task_id in active_processes:
+                del active_processes[task_id]
+        return False, str(e)
+
+
+# ================== Stall Detection ==================
+def check_stalled_downloads():
+    """Background thread to detect and handle stalled downloads"""
+    while True:
+        try:
+            time.sleep(15)  # Check every 15 seconds
+            current_time = time.time()
+            
+            with progress_lock:
+                for task_id, info in list(conversion_progress.items()):
+                    status = info.get('status', '')
+                    
+                    # Skip completed, error, or cancelled tasks
+                    if status in ['completed', 'error', 'cancelled', 'unknown']:
+                        continue
+                    
+                    last_update = info.get('last_update', 0)
+                    if last_update == 0:
+                        continue
+                    
+                    stall_time = current_time - last_update
+                    
+                    # Different stall timeouts for different stages
+                    if status == 'downloading':
+                        timeout = STALL_TIMEOUT
+                    elif status in ['processing', 'embedding']:
+                        timeout = PROCESSING_STALL_TIMEOUT  # More time for processing
+                    else:
+                        timeout = STALL_TIMEOUT
+                    
+                    if stall_time > timeout:
+                        logger.warning(f"[STALL] Task {task_id[:8]} stalled for {int(stall_time)}s in status '{status}'")
+                        
+                        # Try to kill any active process
+                        with process_lock:
+                            if task_id in active_processes:
+                                process = active_processes[task_id]
+                                try:
+                                    if hasattr(process, 'pid'):
+                                        kill_process_tree(process.pid)
+                                    else:
+                                        process.kill()
+                                    del active_processes[task_id]
+                                    logger.info(f"[STALL] Killed process for {task_id[:8]}")
+                                except Exception as e:
+                                    logger.error(f"[STALL] Error killing process: {e}")
+                        
+                        # Mark as error
+                        conversion_progress[task_id] = {
+                            'status': 'error',
+                            'percent': info.get('percent', 0),
+                            'message': f'Process stalled after {int(stall_time)}s. Please try again.',
+                            'last_update': current_time
+                        }
+                        
+                        # Cleanup files
+                        try:
+                            for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+                                for fname in os.listdir(folder):
+                                    if fname.startswith(task_id):
+                                        try:
+                                            os.remove(os.path.join(folder, fname))
+                                        except:
+                                            pass
+                        except Exception as e:
+                            logger.error(f"[STALL] Cleanup error: {e}")
+                            
+        except Exception as e:
+            logger.error(f"[STALL-CHECKER] Error: {e}")
+
+# Start stall detection thread
+threading.Thread(target=check_stalled_downloads, daemon=True).start()
+
+
 # ================== Background Cleanup ==================
 def cleanup_old_files():
     while True:
@@ -152,9 +380,11 @@ def cleanup_old_files():
                             if os.path.isfile(filepath):
                                 file_age = now - os.path.getmtime(filepath)
                                 if file_age > CLEANUP_AGE:
-                                    task_id = filename.split('.')[0]
+                                    task_id = filename.split('.')[0].split('_')[0]
                                     with progress_lock:
-                                        if task_id not in conversion_progress:
+                                        task_info = conversion_progress.get(task_id, {})
+                                        # Don't delete files for active tasks
+                                        if task_info.get('status') not in ['downloading', 'processing', 'embedding', 'connecting', 'starting']:
                                             os.remove(filepath)
                                             cleaned += 1
                         except (PermissionError, FileNotFoundError, OSError):
@@ -166,6 +396,7 @@ def cleanup_old_files():
         time.sleep(300)
 
 threading.Thread(target=cleanup_old_files, daemon=True).start()
+
 
 # ================== Helper Functions ==================
 def normalize_youtube_url(url):
@@ -190,6 +421,7 @@ def normalize_youtube_url(url):
     except Exception:
         return url
 
+
 def validate_url(url):
     try:
         parsed = urlparse(url)
@@ -210,13 +442,9 @@ def validate_url(url):
     except Exception:
         return False
 
+
 def download_thumbnail(url, save_path):
-    """
-    Download and optimize thumbnail image for artwork:
-    - Center-crops to a square (no white padding)
-    - Resizes to 600x600
-    - Saves as JPEG
-    """
+    """Download and optimize thumbnail image for artwork"""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36'
@@ -226,14 +454,11 @@ def download_thumbnail(url, save_path):
         
         img = Image.open(BytesIO(resp.content))
 
-        # Convert to RGB (strip alpha)
         if img.mode != 'RGB':
             img = img.convert('RGB')
 
-        # Center-crop to a square (no padding)
         w, h = img.size
         if w != h:
-            # Take the shorter side to make a square
             min_side = min(w, h)
             left = (w - min_side) // 2
             top = (h - min_side) // 2
@@ -241,27 +466,26 @@ def download_thumbnail(url, save_path):
             bottom = top + min_side
             img = img.crop((left, top, right, bottom))
 
-        # Resize to 600x600 (or smaller if image is small)
         target_size = 600
         if img.width != target_size or img.height != target_size:
             img = img.resize((target_size, target_size), Image.Resampling.LANCZOS)
 
-        # Save as JPEG
         img.save(save_path, 'JPEG', quality=95, optimize=True, progressive=False)
         
         if os.path.exists(save_path):
             saved_size = os.path.getsize(save_path)
-            logger.info(f"[THUMBNAIL] Saved square thumbnail: {save_path} ({saved_size} bytes, {img.width}x{img.height})")
+            logger.info(f"[THUMBNAIL] Saved: {save_path} ({saved_size} bytes)")
             return True
         
-        logger.error(f"[THUMBNAIL] File not saved: {save_path}")
         return False
 
     except Exception as e:
         logger.error(f"[THUMBNAIL ERROR] {e}")
         return False
 
-def embed_artwork_mp3_ffmpeg(audio_file, thumbnail_path, output_file):
+
+def embed_artwork_mp3_ffmpeg(audio_file, thumbnail_path, output_file, task_id):
+    """Embed artwork in MP3 with progress tracking"""
     try:
         cmd = [
             'ffmpeg', '-y',
@@ -275,14 +499,17 @@ def embed_artwork_mp3_ffmpeg(audio_file, thumbnail_path, output_file):
             '-metadata:s:v', 'comment=Cover (front)',
             output_file
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode == 0 and os.path.exists(output_file):
+        
+        success, error = run_ffmpeg_with_progress(cmd, task_id, timeout=120, stage="embedding")
+        if success and os.path.exists(output_file):
             return True
-        logger.error(f"[FFMPEG-MP3] {r.stderr[:200]}")
+        
+        logger.error(f"[FFMPEG-MP3] {error[:200] if error else 'unknown error'}")
         return False
     except Exception as e:
         logger.error(f"[FFMPEG-MP3] Error: {e}")
         return False
+
 
 def embed_metadata_mp3_mutagen(mp3_path, metadata, thumbnail_path=None):
     try:
@@ -294,7 +521,6 @@ def embed_metadata_mp3_mutagen(mp3_path, metadata, thumbnail_path=None):
             audio.tags.add(TIT2(encoding=3, text=metadata['title']))
         if metadata.get('artist'):
             audio.tags.add(TPE1(encoding=3, text=metadata['artist']))
-        # audio.tags.add(TALB(encoding=3, text=metadata.get('album', 'Downloaded Audio')))
         if metadata.get('year'):
             try:
                 audio.tags.add(TDRC(encoding=3, text=str(metadata['year'])))
@@ -313,6 +539,7 @@ def embed_metadata_mp3_mutagen(mp3_path, metadata, thumbnail_path=None):
         logger.error(f"[MP3-METADATA] {e}")
         return False
 
+
 def embed_metadata_aac(m4a_path, metadata, thumbnail_path=None):
     try:
         audio = MP4(m4a_path)
@@ -320,7 +547,6 @@ def embed_metadata_aac(m4a_path, metadata, thumbnail_path=None):
             audio['\xa9nam'] = metadata['title']
         if metadata.get('artist'):
             audio['\xa9ART'] = metadata['artist']
-        # audio['\xa9alb'] = metadata.get('album', 'Downloaded Audio')
         if metadata.get('year'):
             audio['\xa9day'] = str(metadata['year'])
         if metadata.get('genre'):
@@ -336,6 +562,7 @@ def embed_metadata_aac(m4a_path, metadata, thumbnail_path=None):
         logger.error(f"[AAC-METADATA] {e}")
         return False
 
+
 def embed_metadata_opus(opus_file, metadata, thumbnail_path=None):
     try:
         audio = OggOpus(opus_file)
@@ -343,7 +570,6 @@ def embed_metadata_opus(opus_file, metadata, thumbnail_path=None):
             audio['TITLE'] = metadata['title']
         if metadata.get('artist'):
             audio['ARTIST'] = metadata['artist']
-        # audio['ALBUM'] = metadata.get('album', 'Downloaded Audio')
         if metadata.get('year'):
             audio['DATE'] = str(metadata['year'])
         if metadata.get('genre'):
@@ -368,6 +594,7 @@ def embed_metadata_opus(opus_file, metadata, thumbnail_path=None):
         logger.error(f"[OPUS-METADATA] {e}")
         return False
 
+
 def embed_metadata_ogg(ogg_file, metadata, thumbnail_path=None):
     try:
         audio = OggVorbis(ogg_file)
@@ -375,7 +602,6 @@ def embed_metadata_ogg(ogg_file, metadata, thumbnail_path=None):
             audio['TITLE'] = metadata['title']
         if metadata.get('artist'):
             audio['ARTIST'] = metadata['artist']
-        # audio['ALBUM'] = metadata.get('album', 'Downloaded Audio')
         if metadata.get('year'):
             audio['DATE'] = str(metadata['year'])
         if metadata.get('genre'):
@@ -400,6 +626,7 @@ def embed_metadata_ogg(ogg_file, metadata, thumbnail_path=None):
         logger.error(f"[OGG-METADATA] {e}")
         return False
 
+
 def get_best_thumbnail(info):
     thumbs = info.get('thumbnails', [])
     if not thumbs:
@@ -415,38 +642,73 @@ def get_best_thumbnail(info):
             return url
     return thumbs_sorted[0].get('url', '') if thumbs_sorted else info.get('thumbnail', '')
 
+
 def progress_hook(d, task_id):
+    """Enhanced progress hook with better tracking for long downloads"""
     try:
         with progress_lock:
             if task_id not in conversion_progress:
                 return
+            
+            # Always update last_update timestamp
+            conversion_progress[task_id]['last_update'] = time.time()
+            
             if d['status'] == 'downloading':
                 total = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
                 downloaded = d.get('downloaded_bytes', 0)
+                speed = d.get('speed', 0)
+                eta = d.get('eta', 0)
+                
                 if total > 0:
                     percent = min((downloaded / total) * 85, 85)
+                    
+                    # Format sizes for display
+                    downloaded_mb = downloaded / (1024 * 1024)
+                    total_mb = total / (1024 * 1024)
+                    
+                    message = f'Downloading... {int(percent)}% ({downloaded_mb:.1f}/{total_mb:.1f} MB)'
+                    
+                    if speed and speed > 0:
+                        speed_mb = speed / (1024 * 1024)
+                        message += f' @ {speed_mb:.1f} MB/s'
+                    
+                    if eta and eta > 0:
+                        eta_min = int(eta // 60)
+                        eta_sec = int(eta % 60)
+                        if eta_min > 0:
+                            message += f' - ETA: {eta_min}m {eta_sec}s'
+                        else:
+                            message += f' - ETA: {eta_sec}s'
                 else:
                     current = conversion_progress.get(task_id, {})
-                    percent = min(current.get('percent', 5) + 0.5, 85)
+                    percent = min(current.get('percent', 5) + 0.3, 85)
+                    message = f'Downloading... {int(percent)}%'
+                
                 current_percent = conversion_progress[task_id].get('percent', 0)
-                if abs(percent - current_percent) >= 1:
-                    conversion_progress[task_id] = {
+                # Update more frequently (every 0.5%)
+                if abs(percent - current_percent) >= 0.5 or (time.time() - conversion_progress[task_id].get('last_message_update', 0)) > 5:
+                    conversion_progress[task_id].update({
                         'status': 'downloading',
                         'percent': percent,
-                        'speed': d.get('speed', 0),
-                        'eta': d.get('eta', 0),
+                        'speed': speed,
+                        'eta': eta,
                         'downloaded_bytes': downloaded,
                         'total_bytes': total,
-                        'message': f'Downloading... {int(percent)}%'
-                    }
+                        'message': message,
+                        'last_message_update': time.time()
+                    })
+                    
             elif d['status'] == 'finished':
-                conversion_progress[task_id] = {
+                conversion_progress[task_id].update({
                     'status': 'processing',
                     'percent': 87,
-                    'message': 'Processing file...'
-                }
-    except Exception:
-        pass
+                    'message': 'Download complete. Processing file...',
+                    'last_update': time.time()
+                })
+                
+    except Exception as e:
+        logger.error(f"[PROGRESS] Error: {e}")
+
 
 def get_available_formats(info):
     formats = info.get('formats', [])
@@ -466,6 +728,7 @@ def get_available_formats(info):
                 available.add('144p')
     return sorted(list(available), key=lambda x: int(x.replace('p', '').replace('best', '9999')), reverse=True)
 
+
 def sanitize_filename(filename, max_length=100):
     filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', filename)
     filename = re.sub(r'[\s\-]+', '_', filename)
@@ -475,34 +738,45 @@ def sanitize_filename(filename, max_length=100):
         filename = filename[:max_length]
     return filename or 'download'
 
+
 def get_base_ydl_opts():
+    """Enhanced yt-dlp options for better handling of long videos"""
     return {
         'quiet': True,
         'no_warnings': True,
         'noplaylist': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'socket_timeout': 30,
-        'retries': 5,
-        'fragment_retries': 5,
+        'socket_timeout': 60,
+        'retries': 10,
+        'fragment_retries': 10,
+        'file_access_retries': 5,
+        'extractor_retries': 5,
         'ignoreerrors': False,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-us,en;q=0.5',
             'Accept-Encoding': 'gzip, deflate',
         },
         'http_chunk_size': 10485760,
         'prefer_ffmpeg': True,
+        'keepvideo': False,
+        'no_color': True,
+        'concurrent_fragment_downloads': 4,
+        'buffersize': 1024 * 16,
+        'noprogress': False,
     }
+
 
 # ================== Routes ==================
 
 @app.route('/')
 def index():
     return render_template('index.html')
+
 
 @app.route('/api/video-info', methods=['POST'])
 @limiter.limit("60 per minute")
@@ -533,13 +807,26 @@ def get_video_info():
 
             duration = info.get('duration', 0)
             if duration and duration > MAX_DURATION:
-                return jsonify({'error': f'Video too long. Max {MAX_DURATION // 60} minutes.'}), 400
+                hours = MAX_DURATION // 3600
+                return jsonify({'error': f'Video too long. Max {hours} hours allowed.'}), 400
+
+            # Format duration nicely
+            if duration:
+                hours = duration // 3600
+                minutes = (duration % 3600) // 60
+                seconds = duration % 60
+                if hours > 0:
+                    duration_formatted = f"{hours}:{minutes:02d}:{seconds:02d}"
+                else:
+                    duration_formatted = f"{minutes}:{seconds:02d}"
+            else:
+                duration_formatted = 'Unknown'
 
             result = {
                 'success': True,
                 'title': info.get('title', 'Unknown'),
                 'duration': duration,
-                'duration_formatted': str(timedelta(seconds=duration)) if duration else 'Unknown',
+                'duration_formatted': duration_formatted,
                 'thumbnail': get_best_thumbnail(info),
                 'uploader': info.get('uploader', info.get('channel', 'Unknown')),
                 'platform': info.get('extractor', 'Unknown').replace(':', ' ').title(),
@@ -560,6 +847,7 @@ def get_video_info():
         logger.error(f"[INFO ERROR] {e}")
         return jsonify({'error': 'Could not fetch video info'}), 400
 
+
 @app.route('/api/audio-formats')
 def get_audio_formats():
     formats_list = []
@@ -574,6 +862,7 @@ def get_audio_formats():
             'recommended': cfg.get('recommended', False)
         })
     return jsonify({'formats': formats_list})
+
 
 @app.route('/api/convert', methods=['POST'])
 @limiter.limit("20 per minute")
@@ -599,7 +888,8 @@ def convert_media():
         conversion_progress[task_id] = {
             'status': 'initializing',
             'percent': 1,
-            'message': 'Preparing download...'
+            'message': 'Preparing download...',
+            'last_update': time.time()
         }
 
     logger.info(f"[CONVERT] Started {task_id[:8]} - {format_type} ({audio_format if format_type=='audio' else quality})")
@@ -610,17 +900,43 @@ def convert_media():
 
     def run_conversion():
         acquired = False
+        start_time = time.time()
+        video_duration = 0
+        
         try:
-            acquired = active_downloads.acquire(timeout=60)
+            acquired = active_downloads.acquire(timeout=120)
             if not acquired:
-                raise Exception("Too many concurrent downloads. Please try again.")
+                raise Exception("Server busy. Too many concurrent downloads. Please try again.")
 
             with progress_lock:
                 conversion_progress[task_id].update({
                     'status': 'connecting',
-                    'percent': 3,
-                    'message': 'Connecting to server...'
+                    'percent': 2,
+                    'message': 'Connecting to server...',
+                    'last_update': time.time()
                 })
+
+            # First, get video info to calculate timeout
+            try:
+                ydl_opts_info = get_base_ydl_opts()
+                ydl_opts_info.update({'skip_download': True})
+                with yt_dlp.YoutubeDL(ydl_opts_info) as ydl:
+                    pre_info = ydl.extract_info(url, download=False)
+                    if pre_info.get('_type') == 'playlist' and pre_info.get('entries'):
+                        pre_info = pre_info['entries'][0]
+                    video_duration = pre_info.get('duration', 0)
+                    
+                    if video_duration > 3600:
+                        logger.info(f"[CONVERT] Long video detected: {video_duration//60} minutes")
+            except Exception as e:
+                logger.warning(f"[CONVERT] Could not get duration: {e}")
+                video_duration = 3600  # Assume 1 hour if unknown
+
+            # Calculate dynamic timeout
+            download_timeout = calculate_timeout(video_duration)
+            ffmpeg_timeout = calculate_ffmpeg_timeout(video_duration)
+            
+            logger.info(f"[CONVERT] Timeouts - Download: {download_timeout}s, FFmpeg: {ffmpeg_timeout}s")
 
             ydl_opts = get_base_ydl_opts()
 
@@ -645,17 +961,55 @@ def convert_media():
                 conversion_progress[task_id].update({
                     'status': 'starting',
                     'percent': 5,
-                    'message': 'Starting download...'
+                    'message': 'Starting download...',
+                    'last_update': time.time()
                 })
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'media')
-                clean_title = sanitize_filename(title)
+            # Download with timeout using threading
+            download_completed = threading.Event()
+            download_error = [None]
+            info_data = [None]
+
+            def download_thread():
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        info_data[0] = info
+                    download_completed.set()
+                except Exception as e:
+                    download_error[0] = str(e)
+                    download_completed.set()
+
+            dl_thread = threading.Thread(target=download_thread, daemon=True)
+            dl_thread.start()
+
+            # Wait for download with timeout
+            if not download_completed.wait(timeout=download_timeout):
+                logger.error(f"[CONVERT] Download timed out after {download_timeout}s")
+                raise Exception(f"Download timed out after {download_timeout//60} minutes. The video might be too large or the connection is slow.")
+
+            if download_error[0]:
+                raise Exception(download_error[0])
+
+            info = info_data[0]
+            if not info:
+                raise Exception("Failed to extract video info")
+
+            title = info.get('title', 'media')
+            clean_title = sanitize_filename(title)
+
+            # Update progress
+            with progress_lock:
+                conversion_progress[task_id].update({
+                    'status': 'processing',
+                    'percent': 86,
+                    'message': 'Download complete. Locating file...',
+                    'last_update': time.time()
+                })
 
             # Locate downloaded file
             downloaded_file = None
-            for ext in ['.m4a', '.mp3', '.mp4', '.webm', '.mkv', '.opus', '.ogg']:
+            for ext in ['.mp4', '.m4a', '.mp3', '.webm', '.mkv', '.opus', '.ogg', '.wav', '.flac']:
                 p = output_path + ext
                 if os.path.exists(p):
                     downloaded_file = p
@@ -668,6 +1022,9 @@ def convert_media():
             if not downloaded_file or not os.path.exists(downloaded_file):
                 raise Exception("Downloaded file not found")
 
+            file_size = os.path.getsize(downloaded_file)
+            logger.info(f"[CONVERT] Downloaded: {downloaded_file} ({file_size / (1024*1024):.1f} MB)")
+
             # ===== AUDIO BRANCH =====
             if format_type == 'audio':
                 cfg = AUDIO_FORMATS[audio_format]
@@ -677,7 +1034,8 @@ def convert_media():
                     conversion_progress[task_id].update({
                         'status': 'processing',
                         'percent': 88,
-                        'message': f'Converting to {cfg["name"]}...'
+                        'message': f'Converting to {cfg["name"]}...',
+                        'last_update': time.time()
                     })
 
                 audio_temp = output_path + f'_temp.{ext}'
@@ -691,10 +1049,10 @@ def convert_media():
                     '-ac', '2',
                     audio_temp
                 ]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-                if r.returncode != 0 or not os.path.exists(audio_temp):
-                    last_line = (r.stderr or '').splitlines()[-1] if r.stderr else 'unknown'
-                    raise Exception(f"{cfg['name']} conversion failed: {last_line}")
+                
+                success, error = run_ffmpeg_with_progress(cmd, task_id, timeout=ffmpeg_timeout, stage="processing")
+                if not success or not os.path.exists(audio_temp):
+                    raise Exception(f"{cfg['name']} conversion failed: {error[:200] if error else 'unknown'}")
 
                 # Download thumbnail
                 thumb_ok = False
@@ -703,7 +1061,8 @@ def convert_media():
                         conversion_progress[task_id].update({
                             'status': 'processing',
                             'percent': 92,
-                            'message': 'Downloading artwork...'
+                            'message': 'Downloading artwork...',
+                            'last_update': time.time()
                         })
                     thumb_url = get_best_thumbnail(info)
                     if thumb_url:
@@ -718,7 +1077,6 @@ def convert_media():
                 metadata = {
                     'title': title,
                     'artist': info.get('uploader', 'Unknown'),
-                    # 'album': 'Downloaded Audio',
                     'year': year,
                     'genre': 'Music'
                 }
@@ -728,10 +1086,11 @@ def convert_media():
                         conversion_progress[task_id].update({
                             'status': 'embedding',
                             'percent': 95,
-                            'message': 'Embedding artwork...'
+                            'message': 'Embedding artwork...',
+                            'last_update': time.time()
                         })
                     if audio_format == 'mp3':
-                        if not embed_artwork_mp3_ffmpeg(audio_temp, thumbnail_path, final_audio):
+                        if not embed_artwork_mp3_ffmpeg(audio_temp, thumbnail_path, final_audio, task_id):
                             shutil.copy(audio_temp, final_audio)
                             embed_metadata_mp3_mutagen(final_audio, metadata, thumbnail_path)
                     elif audio_format == 'aac':
@@ -754,6 +1113,10 @@ def convert_media():
                     elif audio_format == 'ogg':
                         embed_metadata_ogg(final_audio, metadata, None)
 
+                # Update progress during cleanup
+                with progress_lock:
+                    conversion_progress[task_id]['last_update'] = time.time()
+
                 # Cleanup temps
                 try:
                     if os.path.exists(audio_temp):
@@ -768,62 +1131,151 @@ def convert_media():
                 output_file = final_audio
                 thumb_downloaded = thumb_ok
 
-            # ===== VIDEO BRANCH =====
+            # ===== VIDEO BRANCH (OPTIMIZED - NO RE-ENCODING FOR BEST QUALITY) =====
             else:
-                # ===== VIDEO BRANCH – re-encode to target size =====
-                with progress_lock:
-                    conversion_progress[task_id].update({
-                        'status': 'processing',
-                        'percent': 88,
-                        'message': 'Converting video to MP4 (H.264 + AAC)...'
-                    })
-
-                desired_mp4 = output_path + '.mp4'
-
-                # Avoid input == output path (causes "Invalid argument" in ffmpeg)
-                if os.path.abspath(downloaded_file) == os.path.abspath(desired_mp4):
-                    temp_mp4 = output_path + '__enc.mp4'
+                # Check if we need to re-encode or can use the file directly
+                needs_encoding = True
+                needs_full_encoding = True
+                output_file = None
+                
+                file_ext = os.path.splitext(downloaded_file)[1].lower()
+                
+                # If quality is "best", try to avoid re-encoding
+                if quality == 'best':
+                    # If already MP4, use it directly without re-encoding
+                    if file_ext == '.mp4':
+                        logger.info(f"[VIDEO] Quality='best' and file is MP4. Skipping re-encoding!")
+                        output_file = downloaded_file
+                        needs_encoding = False
+                        
+                        with progress_lock:
+                            conversion_progress[task_id].update({
+                                'status': 'processing',
+                                'percent': 95,
+                                'message': 'Video ready (no conversion needed)...',
+                                'last_update': time.time()
+                            })
+                    
+                    # If WebM or MKV, try fast stream copy (no re-encoding, just remux)
+                    elif file_ext in ['.webm', '.mkv']:
+                        logger.info(f"[VIDEO] Quality='best' and file is {file_ext}. Will remux to MP4 (fast, no re-encoding).")
+                        needs_encoding = True
+                        needs_full_encoding = False  # Just remux, don't re-encode
+                    else:
+                        logger.info(f"[VIDEO] Quality='best' but file is {file_ext}. Will convert to MP4.")
+                        needs_encoding = True
+                        needs_full_encoding = True
                 else:
-                    temp_mp4 = desired_mp4
+                    # User selected specific quality (1080p, 720p, etc.) - need to re-encode
+                    logger.info(f"[VIDEO] Quality='{quality}'. Will re-encode to {quality}.")
+                    needs_encoding = True
+                    needs_full_encoding = True
+                
+                # Process video if needed
+                if needs_encoding:
+                    with progress_lock:
+                        if needs_full_encoding:
+                            msg = f'Converting video to MP4 ({quality})...'
+                        else:
+                            msg = 'Remuxing to MP4 (fast)...'
+                        conversion_progress[task_id].update({
+                            'status': 'processing',
+                            'percent': 88,
+                            'message': msg,
+                            'last_update': time.time()
+                        })
 
-                # Pick encode settings based on requested quality
-                encode_cfg = VIDEO_ENCODE_SETTINGS.get(quality, VIDEO_ENCODE_SETTINGS['best'])
+                    desired_mp4 = output_path + '.mp4'
 
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-i', downloaded_file,
-                    '-map', '0:v:0',
-                    '-map', '0:a:0?',
-                    '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-profile:v', 'high',
-                    '-level:v', '4.0',
-                    '-pix_fmt', 'yuv420p',
-                    '-c:a', 'aac',
-                    '-b:a', '160k',
-                    '-ac', '2',
-                    '-movflags', '+faststart'
-                ]
+                    if os.path.abspath(downloaded_file) == os.path.abspath(desired_mp4):
+                        temp_mp4 = output_path + '__enc.mp4'
+                    else:
+                        temp_mp4 = desired_mp4
 
-                # Add scale filter if we want to downscale (e.g., 360p)
-                if encode_cfg['scale']:
-                    cmd.extend(['-vf', f"scale={encode_cfg['scale']}"])
+                    # Build ffmpeg command
+                    if needs_full_encoding:
+                        # Full re-encoding (for quality changes)
+                        encode_cfg = VIDEO_ENCODE_SETTINGS.get(quality, VIDEO_ENCODE_SETTINGS['best'])
 
-                # Use CRF for quality control
-                if encode_cfg['crf']:
-                    cmd.extend(['-crf', encode_cfg['crf']])
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-i', downloaded_file,
+                            '-map', '0:v:0',
+                            '-map', '0:a:0?',
+                            '-c:v', 'libx264',
+                            '-preset', 'veryfast',
+                            '-profile:v', 'high',
+                            '-level:v', '4.0',
+                            '-pix_fmt', 'yuv420p',
+                            '-c:a', 'aac',
+                            '-b:a', '160k',
+                            '-ac', '2',
+                            '-movflags', '+faststart'
+                        ]
 
-                # Optionally cap bitrate for smaller files
-                if encode_cfg['maxrate'] and encode_cfg['bufsize']:
-                    cmd.extend(['-maxrate', encode_cfg['maxrate'], '-bufsize', encode_cfg['bufsize']])
+                        # Only add scale filter if we're downscaling
+                        if encode_cfg['scale']:
+                            cmd.extend(['-vf', f"scale={encode_cfg['scale']}"])
 
-                cmd.append(temp_mp4)
+                        # Use CRF for quality control
+                        if encode_cfg['crf']:
+                            cmd.extend(['-crf', encode_cfg['crf']])
 
-                try:
-                    r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-                    if r.returncode != 0 or not os.path.exists(temp_mp4):
-                        last_line = (r.stderr or '').splitlines()[-1] if r.stderr else 'unknown error'
-                        raise Exception(f"ffmpeg error: {last_line}")
+                        # Optionally cap bitrate for smaller files
+                        if encode_cfg['maxrate'] and encode_cfg['bufsize']:
+                            cmd.extend(['-maxrate', encode_cfg['maxrate'], '-bufsize', encode_cfg['bufsize']])
+
+                        cmd.append(temp_mp4)
+                        
+                        logger.info(f"[VIDEO] Full re-encoding with timeout {ffmpeg_timeout}s")
+                    else:
+                        # Fast remux (just change container, no re-encoding)
+                        # This is MUCH faster (seconds instead of minutes)
+                        cmd = [
+                            'ffmpeg', '-y',
+                            '-i', downloaded_file,
+                            '-c', 'copy',  # Copy streams without re-encoding
+                            '-movflags', '+faststart',
+                            temp_mp4
+                        ]
+                        logger.info(f"[VIDEO] Fast remux (no re-encoding)")
+                        # Use shorter timeout for remux
+                        ffmpeg_timeout = min(ffmpeg_timeout, 300)  # Max 5 min for remux
+
+                    success, error = run_ffmpeg_with_progress(cmd, task_id, timeout=ffmpeg_timeout, stage="processing")
+                    
+                    if not success or not os.path.exists(temp_mp4):
+                        # If remux failed, try full encoding as fallback
+                        if not needs_full_encoding:
+                            logger.warning(f"[VIDEO] Remux failed, falling back to full encoding")
+                            with progress_lock:
+                                conversion_progress[task_id].update({
+                                    'status': 'processing',
+                                    'percent': 89,
+                                    'message': 'Remux failed, converting with encoding...',
+                                    'last_update': time.time()
+                                })
+                            
+                            cmd = [
+                                'ffmpeg', '-y',
+                                '-i', downloaded_file,
+                                '-map', '0:v:0',
+                                '-map', '0:a:0?',
+                                '-c:v', 'libx264',
+                                '-preset', 'veryfast',
+                                '-crf', '20',
+                                '-c:a', 'aac',
+                                '-b:a', '160k',
+                                '-movflags', '+faststart',
+                                temp_mp4
+                            ]
+                            ffmpeg_timeout = calculate_ffmpeg_timeout(video_duration)
+                            success, error = run_ffmpeg_with_progress(cmd, task_id, timeout=ffmpeg_timeout, stage="processing")
+                            
+                            if not success or not os.path.exists(temp_mp4):
+                                raise Exception(f"ffmpeg error: {error[:200] if error else 'unknown error'}")
+                        else:
+                            raise Exception(f"ffmpeg error: {error[:200] if error else 'unknown error'}")
 
                     # Rename temp to final if needed
                     if os.path.abspath(temp_mp4) != os.path.abspath(desired_mp4):
@@ -833,20 +1285,19 @@ def convert_media():
 
                     output_file = desired_mp4
 
-                    # Remove original downloaded file if it's different
+                    # Update progress
+                    with progress_lock:
+                        conversion_progress[task_id]['last_update'] = time.time()
+
+                    # Remove original downloaded file if different from output
                     try:
                         if os.path.exists(downloaded_file) and os.path.abspath(downloaded_file) != os.path.abspath(output_file):
                             os.remove(downloaded_file)
+                            logger.info(f"[VIDEO] Removed original: {downloaded_file}")
                     except Exception as e:
                         logger.warning(f"[VIDEO] Could not remove original: {e}")
-
-                except subprocess.TimeoutExpired:
-                    raise Exception("Video conversion timed out. Please try again.")
-                except Exception as e:
-                    logger.error(f"[VIDEO] Conversion failed: {e}")
-                    raise
-
-                thumb_downloaded = False  # we are not embedding artwork into the video file
+                
+                thumb_downloaded = False
 
             # Verify final output
             if not os.path.exists(output_file):
@@ -857,41 +1308,63 @@ def convert_media():
 
             ext = os.path.splitext(output_file)[1][1:]
 
+            # Calculate total time taken
+            total_time = time.time() - start_time
+            time_str = f"{int(total_time//60)}m {int(total_time%60)}s" if total_time >= 60 else f"{int(total_time)}s"
+
             with progress_lock:
                 conversion_progress[task_id] = {
                     'status': 'completed',
                     'percent': 100,
-                    'message': 'Ready!',
+                    'message': f'Ready! (took {time_str})',
                     'title': clean_title,
                     'filename': os.path.basename(output_file),
                     'file_size': final_size,
-                    'has_thumbnail': thumb_downloaded,
+                    'has_thumbnail': thumb_downloaded if format_type == 'audio' else False,
                     'format': format_type,
                     'audio_format': audio_format if format_type == 'audio' else None,
                     'quality': AUDIO_FORMATS[audio_format]['quality'] if format_type == 'audio' else quality,
-                    'extension': ext
+                    'extension': ext,
+                    'last_update': time.time()
                 }
 
-            logger.info(f"[CONVERT] ✓ {clean_title[:30]} ({final_size} bytes, {ext})")
+            logger.info(f"[CONVERT] ✓ {clean_title[:30]} ({final_size / (1024*1024):.1f} MB, {ext}) in {time_str}")
 
         except Exception as e:
-            err = str(e)[:200]
+            err = str(e)[:300]
             logger.error(f"[CONVERT] ✗ {task_id[:8]}: {err}")
             logger.error(traceback.format_exc())
+            
+            # Kill any remaining processes
+            with process_lock:
+                if task_id in active_processes:
+                    try:
+                        process = active_processes[task_id]
+                        if hasattr(process, 'pid'):
+                            kill_process_tree(process.pid)
+                        else:
+                            process.kill()
+                        del active_processes[task_id]
+                    except:
+                        pass
+            
             with progress_lock:
                 conversion_progress[task_id] = {
                     'status': 'error',
                     'percent': 0,
-                    'message': f'Error: {err}'
+                    'message': f'Error: {err}',
+                    'last_update': time.time()
                 }
+            
             # Cleanup partial files
             try:
-                for fname in os.listdir(DOWNLOAD_FOLDER):
-                    if fname.startswith(task_id):
-                        os.remove(os.path.join(DOWNLOAD_FOLDER, fname))
-                for fname in os.listdir(TEMP_FOLDER):
-                    if fname.startswith(task_id):
-                        os.remove(os.path.join(TEMP_FOLDER, fname))
+                for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+                    for fname in os.listdir(folder):
+                        if fname.startswith(task_id):
+                            try:
+                                os.remove(os.path.join(folder, fname))
+                            except:
+                                pass
             except Exception:
                 pass
         finally:
@@ -906,6 +1379,50 @@ def convert_media():
         'message': 'Conversion started'
     })
 
+
+@app.route('/api/cancel/<task_id>', methods=['POST'])
+def cancel_download(task_id):
+    """Cancel a running download"""
+    # Kill any active process
+    with process_lock:
+        if task_id in active_processes:
+            try:
+                process = active_processes[task_id]
+                if hasattr(process, 'pid'):
+                    kill_process_tree(process.pid)
+                else:
+                    process.kill()
+                del active_processes[task_id]
+                logger.info(f"[CANCEL] Killed process for {task_id[:8]}")
+            except Exception as e:
+                logger.error(f"[CANCEL] Error killing process: {e}")
+    
+    # Update status
+    with progress_lock:
+        if task_id in conversion_progress:
+            conversion_progress[task_id] = {
+                'status': 'cancelled',
+                'percent': 0,
+                'message': 'Download cancelled by user',
+                'last_update': time.time()
+            }
+    
+    # Cleanup files
+    try:
+        for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+            for fname in os.listdir(folder):
+                if fname.startswith(task_id):
+                    try:
+                        os.remove(os.path.join(folder, fname))
+                    except:
+                        pass
+    except Exception:
+        pass
+    
+    logger.info(f"[CANCEL] Task {task_id[:8]} cancelled")
+    return jsonify({'status': 'cancelled'})
+
+
 @app.route('/api/progress/<task_id>')
 @limiter.exempt 
 def get_progress(task_id):
@@ -915,7 +1432,13 @@ def get_progress(task_id):
             'percent': 0,
             'message': 'Task not found'
         }).copy()
+    
+    # Remove internal tracking fields from response
+    prog.pop('last_update', None)
+    prog.pop('last_message_update', None)
+    
     return jsonify(prog)
+
 
 @app.route('/api/download/<task_id>')
 @limiter.limit("50 per minute")
@@ -964,7 +1487,7 @@ def download_file(task_id):
     @after_this_request
     def cleanup(response):
         def delayed():
-            time.sleep(10)
+            time.sleep(30)
             with progress_lock:
                 conversion_progress.pop(task_id, None)
         threading.Thread(target=delayed, daemon=True).start()
@@ -977,6 +1500,7 @@ def download_file(task_id):
         download_name=f"{safe_title}{ext}",
         mimetype=mimetype
     )
+
 
 @app.route('/api/supported-platforms')
 def supported_platforms():
@@ -991,16 +1515,108 @@ def supported_platforms():
         ]
     })
 
+
 @app.route('/health')
 def health_check():
+    active_procs = 0
+    with process_lock:
+        active_procs = len(active_processes)
+    
     return jsonify({
         'status': 'healthy',
         'active_downloads': MAX_CONCURRENT_DOWNLOADS - active_downloads._value,
+        'active_processes': active_procs,
         'cached_videos': len(video_info_cache),
-        'active_tasks': len(conversion_progress)
+        'active_tasks': len(conversion_progress),
+        'max_duration_hours': MAX_DURATION // 3600,
+        'psutil_available': HAS_PSUTIL
     })
 
+
+# Emergency endpoint to kill stuck tasks
+@app.route('/api/admin/kill-all', methods=['POST'])
+def kill_all_downloads():
+    """Emergency: Kill all active downloads"""
+    killed_procs = 0
+    
+    # Kill all processes
+    with process_lock:
+        for task_id, process in list(active_processes.items()):
+            try:
+                if hasattr(process, 'pid'):
+                    kill_process_tree(process.pid)
+                else:
+                    process.kill()
+                killed_procs += 1
+            except:
+                pass
+        active_processes.clear()
+    
+    # Clear all progress
+    killed_tasks = 0
+    with progress_lock:
+        for task_id in list(conversion_progress.keys()):
+            if conversion_progress[task_id].get('status') not in ['completed', 'error', 'cancelled']:
+                conversion_progress[task_id] = {
+                    'status': 'error',
+                    'percent': 0,
+                    'message': 'Manually terminated'
+                }
+                killed_tasks += 1
+    
+    # Cleanup all files
+    cleaned = 0
+    for folder in [DOWNLOAD_FOLDER, TEMP_FOLDER]:
+        try:
+            for fname in os.listdir(folder):
+                try:
+                    os.remove(os.path.join(folder, fname))
+                    cleaned += 1
+                except:
+                    pass
+        except:
+            pass
+    
+    logger.warning(f"[ADMIN] Killed {killed_procs} processes, {killed_tasks} tasks, cleaned {cleaned} files")
+    return jsonify({'killed_processes': killed_procs, 'killed_tasks': killed_tasks, 'cleaned_files': cleaned})
+
+
+# Status endpoint for debugging
+@app.route('/api/admin/status')
+def admin_status():
+    """Get detailed status for debugging"""
+    with progress_lock:
+        tasks = {}
+        for task_id, info in conversion_progress.items():
+            tasks[task_id[:8]] = {
+                'status': info.get('status'),
+                'percent': info.get('percent'),
+                'message': info.get('message', '')[:50],
+                'age': int(time.time() - info.get('last_update', time.time()))
+            }
+    
+    with process_lock:
+        procs = list(active_processes.keys())
+    
+    return jsonify({
+        'tasks': tasks,
+        'active_processes': [p[:8] for p in procs],
+        'semaphore_available': active_downloads._value
+    })
+
+
 if __name__ == '__main__':
-    logger.info("[SERVER] Starting Flask app with multiple audio formats and QuickTime-friendly video...")
+    logger.info("=" * 60)
+    logger.info("[SERVER] Starting Flask Video Downloader")
+    logger.info(f"[SERVER] Max video duration: {MAX_DURATION // 3600} hours")
+    logger.info(f"[SERVER] Download timeout: {DOWNLOAD_TIMEOUT // 60} minutes")
+    logger.info(f"[SERVER] Stall timeout: {STALL_TIMEOUT}s (download), {PROCESSING_STALL_TIMEOUT}s (processing)")
     logger.info(f"[SERVER] Download folder: {os.path.abspath(DOWNLOAD_FOLDER)}")
+    logger.info(f"[SERVER] psutil available: {HAS_PSUTIL}")
+    logger.info("[SERVER] Optimization: 'best' quality skips re-encoding for MP4 files")
+    logger.info("=" * 60)
+    
+    if not HAS_PSUTIL:
+        logger.warning("[SERVER] psutil not installed. Install with: pip install psutil")
+    
     app.run(debug=False, host='0.0.0.0', port=5000)
